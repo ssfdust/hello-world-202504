@@ -9,6 +9,7 @@ candle-core = "0.8.4"
 candle-transformers = "0.8.4"
 clap = { version = "4.5.35", features = ["derive"] }
 hf-hub = "0.4.2"
+promkit = { version = "0.9.1", features = ["readline"] }
 tokenizers = "0.21.1"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"

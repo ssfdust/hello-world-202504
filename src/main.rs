@@ -1,14 +1,15 @@
 mod token_output_stream;
-
-use std::io::{Write, BufRead};
+use std::io::Write;
 use tokenizers::Tokenizer;
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Tensor, Device};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
-use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
 use token_output_stream::TokenOutputStream;
+use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
+
+use promkit::preset::readline::Readline;
 
 #[derive(Debug)]
 struct ModelConfig {
@@ -30,9 +31,6 @@ struct ModelConfig {
     /// Process prompt elements separately.
     split_prompt: bool,
 
-    /// Run on CPU rather than GPU even if a GPU is available.
-    device: Device,
-
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     repeat_penalty: f32,
 
@@ -47,7 +45,6 @@ impl Default for ModelConfig {
             temperature: 0.8,
             seed: 299792458,
             split_prompt: false,
-            device: Device::Cpu,
             repeat_penalty: 1.1,
             repeat_last_n: 64,
             top_p: None,
@@ -93,7 +90,7 @@ impl ModelConfig {
             &format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
-        let model = Qwen2::from_gguf(model, &mut file, &self.device)?;
+        let model = Qwen2::from_gguf(model, &mut file, &Device::Cpu)?;
         Ok(model)
     }
 }
@@ -111,8 +108,8 @@ fn format_size(size_in_bytes: usize) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
-
     let config = ModelConfig::default();
+    let mut p = Readline::default().prompt()?;
 
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
@@ -127,19 +124,24 @@ fn main() -> anyhow::Result<()> {
     );
 
     let mut model = config.model()?;
-    println!("model built");
 
     let tokenizer = config.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
-    println!("Hello.");
+    println!(">> Hello, what can I do for you?");
     loop {
-        let stdin = std::io::stdin();
-        let input = stdin.lock().lines().next().unwrap().unwrap();
-        if input == "exit" {
-            break;
+        match p.run() {
+            Ok(input) => {
+                if input.len() > 0 {
+                    println!("\n>>> ");
+                    std::io::stdout().flush()?;
+                    tos = generate(&input.to_string(), &config, tos, &mut model)?;
+                }
+            }
+            Err(_) => {
+                println!("Bye!");
+                break;
+            }
         }
-        println!("input is {}", input);
-        tos = generate(&input, &config, tos, &mut model)?;
     }
 
     Ok(())
@@ -147,7 +149,6 @@ fn main() -> anyhow::Result<()> {
 
 fn generate(prompt: &str, config: &ModelConfig, mut tos: TokenOutputStream, model: &mut Qwen2) -> anyhow::Result<TokenOutputStream> {
     let prompt_str = format!("<｜User｜>{prompt}<｜Assistant｜>");
-    print!("formatted instruct prompt: {}", &prompt_str);
     let tokens = tos
         .tokenizer()
         .encode(prompt_str, true)
@@ -170,25 +171,22 @@ fn generate(prompt: &str, config: &ModelConfig, mut tos: TokenOutputStream, mode
         };
         LogitsProcessor::from_sampling(config.seed, sampling)
     };
-    let start_prompt_processing = std::time::Instant::now();
     let mut next_token = if !config.split_prompt {
-        let input = Tensor::new(tokens, &config.device)?.unsqueeze(0)?;
+        let input = Tensor::new(tokens, &Device::Cpu)?.unsqueeze(0)?;
         let logits = model.forward(&input, 0)?;
         let logits = logits.squeeze(0)?;
         logits_processor.sample(&logits)?
     } else {
         let mut next_token = 0;
         for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &config.device)?.unsqueeze(0)?;
+            let input = Tensor::new(&[*token], &Device::Cpu)?.unsqueeze(0)?;
             let logits = model.forward(&input, pos)?;
             let logits = logits.squeeze(0)?;
             next_token = logits_processor.sample(&logits)?
         }
         next_token
     };
-    let prompt_dt = start_prompt_processing.elapsed();
     all_tokens.push(next_token);
-    println!("loaddd");
     if let Some(t) = tos.next_token(next_token)? {
         print!("{t}");
         std::io::stdout().flush()?;
@@ -197,10 +195,8 @@ fn generate(prompt: &str, config: &ModelConfig, mut tos: TokenOutputStream, mode
     let eos_token = "<｜end▁of▁sentence｜>";
 
     let eos_token = *tos.tokenizer().get_vocab(true).get(eos_token).unwrap();
-    let start_post_prompt = std::time::Instant::now();
-    let mut sampled = 0;
     for index in 0..to_sample {
-        let input = Tensor::new(&[next_token], &config.device)?.unsqueeze(0)?;
+        let input = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
         let logits = model.forward(&input, tokens.len() + index)?;
         let logits = logits.squeeze(0)?;
         let logits = if config.repeat_penalty == 1. {
@@ -219,7 +215,6 @@ fn generate(prompt: &str, config: &ModelConfig, mut tos: TokenOutputStream, mode
             print!("{t}");
             std::io::stdout().flush()?;
         }
-        sampled += 1;
         if next_token == eos_token {
             break;
         };
@@ -227,16 +222,7 @@ fn generate(prompt: &str, config: &ModelConfig, mut tos: TokenOutputStream, mode
     if let Some(rest) = tos.decode_rest().map_err(candle_core::Error::msg)? {
         print!("{rest}");
     }
+    println!("");
     std::io::stdout().flush()?;
-    let dt = start_post_prompt.elapsed();
-    println!(
-        "\n\n{:4} prompt tokens processed: {:.2} token/s",
-        tokens.len(),
-        tokens.len() as f64 / prompt_dt.as_secs_f64(),
-    );
-    println!(
-        "{sampled:4} tokens generated: {:.2} token/s",
-        sampled as f64 / dt.as_secs_f64(),
-    );
     Ok(tos)
 }
